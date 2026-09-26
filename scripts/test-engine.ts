@@ -4,6 +4,15 @@ import { applyEdit, computeSnap, assertInvariants } from '../src/lib/engine';
 import { parseVtt, serializeVtt } from '../src/lib/vtt';
 import { parseTimestamp, formatTimestamp, MIN_DURATION, SNAP_DISTANCE } from '../src/lib/time';
 import { validateAnchors, mapTime, previewRemap, applyRemap } from '../src/lib/remap';
+import {
+  validateTermRows,
+  tokenizeCueText,
+  replaceInText,
+  previewTerms,
+  applyTerms,
+  newTermRow,
+  type TermRuleRow,
+} from '../src/lib/terms';
 
 let passed = 0;
 function test(name: string, fn: () => void) {
@@ -413,4 +422,164 @@ test('映射结果可序列化往返', () => {
   assert(Math.abs(reparsed[1].end - next[1].end) < 1e-3);
 });
 
+// ---------- 术语审校 ----------
+function mkRows(spec: Array<[string, string]>): TermRuleRow[] {
+  return spec.map(([source, target]) => ({ ...newTermRow(), source, target }));
+}
+
+test('规则校验：原词/推荐词均须非空，全空行忽略', () => {
+  // 全空行被忽略
+  assert.deepEqual(validateTermRows(mkRows([['', ''], ['  ', ' ']])).rules, []);
+  // 只填一边 → 报错
+  assert(validateTermRows(mkRows([['帐号', '']])).error !== null);
+  assert(validateTermRows(mkRows([['', '账号']])).error !== null);
+  // 合法规则：首尾空白被去除，顺序保持
+  const ok = validateTermRows(mkRows([[' 帐号 ', '账号'], ['foo', 'bar']]));
+  assert.equal(ok.error, null);
+  assert.deepEqual(ok.rules, [
+    { source: '帐号', target: '账号' },
+    { source: 'foo', target: 'bar' },
+  ]);
+});
+
+test('规则校验：原词重复被拒绝（区分大小写）', () => {
+  assert(validateTermRows(mkRows([['帐号', '账号'], ['帐号', '賬號']])).error !== null);
+  // 大小写不同不算重复
+  assert.equal(validateTermRows(mkRows([['Foo', 'x'], ['foo', 'y']])).error, null);
+});
+
+test('正文分词：标签与实体是边界，未闭合符号按普通文本', () => {
+  const segs = tokenizeCueText('a<b>c</b>&amp;d&#39;e < f');
+  assert.deepEqual(
+    segs.map((s) => `${s.kind}:${s.value}`),
+    ['text:a', 'raw:<b>', 'text:c', 'raw:</b>', 'raw:&amp;', 'text:d', 'raw:&#39;', 'text:e < f'],
+  );
+  // 边界片段的原文偏移正确
+  assert.equal(segs[1].start, 1);
+  assert.equal(segs[4].start, 9);
+});
+
+test('字面匹配区分大小写', () => {
+  const r = replaceInText('foo Foo FOO', [{ source: 'Foo', target: 'Bar' }]);
+  assert.equal(r.text, 'foo Bar FOO');
+  assert.equal(r.hits.length, 1);
+  assert.equal(r.hits[0].start, 4);
+});
+
+test('同一位置取最长原词，等长按规则顺序', () => {
+  // "abc" 与 "ab" 同时命中位置 0 → 取更长的 "abc"
+  const r1 = replaceInText('abc ab', [
+    { source: 'ab', target: 'X' },
+    { source: 'abc', target: 'Y' },
+  ]);
+  assert.equal(r1.text, 'Y X');
+  // 等长（同词，绕过校验直接调用）→ 先出现的规则生效
+  const r2 = replaceInText('ab', [
+    { source: 'ab', target: 'X' },
+    { source: 'ab', target: 'Y' },
+  ]);
+  assert.equal(r2.text, 'X');
+});
+
+test('已选中的字符不再重复匹配，替换结果不级联', () => {
+  // "aa" 消费后跳过，"aaaa" → 两次命中而非重叠匹配
+  const r1 = replaceInText('aaaa', [{ source: 'aa', target: 'X' }]);
+  assert.equal(r1.text, 'XX');
+  assert.equal(r1.hits.length, 2);
+  // "ab" 命中后，"bc" 不能再从 b 处匹配
+  const r2 = replaceInText('abc', [
+    { source: 'ab', target: 'X' },
+    { source: 'bc', target: 'Y' },
+  ]);
+  assert.equal(r2.text, 'Xc');
+  // 替换出的 "b" 不会触发 b→c（对原文扫描）
+  const r3 = replaceInText('a', [
+    { source: 'a', target: 'b' },
+    { source: 'b', target: 'c' },
+  ]);
+  assert.equal(r3.text, 'b');
+});
+
+test('标签与实体作为边界且原样保留', () => {
+  // 标签内的可见文本正常替换，标签本身原样保留
+  const r1 = replaceInText('<b>hello</b> world', [{ source: 'hello', target: '你好' }]);
+  assert.equal(r1.text, '<b>你好</b> world');
+  // 跨越标签边界的词不匹配
+  const r2 = replaceInText('he<b>llo</b>', [{ source: 'hello', target: 'X' }]);
+  assert.equal(r2.text, 'he<b>llo</b>');
+  assert.equal(r2.hits.length, 0);
+  // 实体是边界：可见文本里不存在 "Tom & Jerry"
+  const r3 = replaceInText('Tom &amp; Jerry', [
+    { source: 'Tom & Jerry', target: 'X' },
+    { source: 'Jerry', target: 'jerry' },
+  ]);
+  assert.equal(r3.text, 'Tom &amp; jerry');
+  // 实体自身不会被当作普通文本命中
+  const r4 = replaceInText('a &amp; b', [{ source: 'amp', target: 'X' }]);
+  assert.equal(r4.text, 'a &amp; b');
+});
+
+test('多行正文与带说话人标签的正文', () => {
+  const r = replaceInText('<v 旁白>第一行 foo\n第二行 foo</v>', [{ source: 'foo', target: 'bar' }]);
+  assert.equal(r.text, '<v 旁白>第一行 bar\n第二行 bar</v>');
+  assert.equal(r.hits.length, 2);
+});
+
+test('命中预览：只返回有命中的字幕，位置/原文/替换后正文正确', () => {
+  const cues: Cue[] = [
+    { id: 'c0', start: 0, end: 1, text: '没有命中' },
+    { id: 'c1', start: 1, end: 2, text: 'x 帐号 y 帐号' },
+    { id: 'c2', start: 2, end: 3, text: '<i>帐号</i>' },
+  ];
+  const rows = previewTerms(cues, [{ source: '帐号', target: '账号' }]);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].cue.id, 'c1');
+  assert.equal(rows[0].index, 1);
+  assert.equal(rows[0].hits.length, 2);
+  assert.equal(rows[0].hits[0].start, 2);
+  assert.equal(rows[0].newText, 'x 账号 y 账号');
+  assert.equal(rows[1].cue.id, 'c2');
+  assert.equal(rows[1].newText, '<i>账号</i>');
+  // 替换后正文中替换片段的高亮区间正确
+  assert.equal(rows[1].outSpans.length, 1);
+  assert.equal(rows[1].newText.slice(rows[1].outSpans[0].start, rows[1].outSpans[0].end), '账号');
+});
+
+test('应用替换：仅选中字幕文本被改，id/时间不变，未选中保持同引用', () => {
+  const cues: Cue[] = [
+    { id: 'c0', start: 0, end: 1, text: '帐号 A' },
+    { id: 'c1', start: 1, end: 2, text: '帐号 B' },
+    { id: 'c2', start: 2, end: 3, text: '无关' },
+  ];
+  const rules = [{ source: '帐号', target: '账号' }];
+  const next = applyTerms(cues, rules, new Set(['c1']));
+  assert.equal(next[0], cues[0]); // 未选中：同一引用
+  assert.equal(next[2], cues[2]); // 无命中：同一引用
+  assert.equal(next[1].text, '账号 B');
+  assert.equal(next[1].id, 'c1');
+  assert.equal(next[1].start, 1);
+  assert.equal(next[1].end, 2);
+  // 原数组未被修改
+  assert.equal(cues[1].text, '帐号 B');
+  // 空选择 / 无命中 → 返回原数组（不产生撤销记录）
+  assert.equal(applyTerms(cues, rules, new Set()), cues);
+  assert.equal(applyTerms(cues, rules, new Set(['c2'])), cues);
+  assert.equal(applyTerms(cues, [], new Set(['c0'])), cues);
+});
+
+test('术语替换结果可序列化往返', () => {
+  const cues: Cue[] = [
+    { id: 'keep-id', start: 0.5, end: 2, text: '<b>帐号</b> 与 &amp; 实体' },
+  ];
+  const next = applyTerms(cues, [{ source: '帐号', target: '账号' }], new Set(['keep-id']));
+  const text = serializeVtt(next);
+  assert(text.includes('<b>账号</b> 与 &amp; 实体'));
+  const reparsed = parseVtt(text);
+  assert.equal(reparsed.length, 1);
+  assert.equal(reparsed[0].id, 'keep-id');
+  assert.equal(reparsed[0].text, '<b>账号</b> 与 &amp; 实体');
+  assert(Math.abs(reparsed[0].start - 0.5) < 1e-9);
+});
+
 console.log(`\n全部 ${passed} 个测试通过 ✅`);
+
