@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "esbuild scripts/test-engine.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/test-engine.mjs && node node_modules/.cache/test-engine.mjs"
+    "test": "esbuild scripts/test-engine.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/test-engine.mjs && node node_modules/.cache/test-engine.mjs && esbuild scripts/test-ui-smoke.ts --bundle --platform=node --format=cjs --jsx=automatic --outfile=node_modules/.cache/test-ui-smoke.cjs && node node_modules/.cache/test-ui-smoke.cjs"
   },
   "dependencies": {
     "react": "^18.3.1",

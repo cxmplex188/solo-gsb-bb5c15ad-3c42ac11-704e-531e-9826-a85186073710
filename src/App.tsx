@@ -3,11 +3,13 @@ import Timeline from './components/Timeline';
 import CueTable from './components/CueTable';
 import ImportModal from './components/ImportModal';
 import RemapModal from './components/RemapModal';
+import TermModal from './components/TermModal';
 import VideoPlayer from './components/VideoPlayer';
 import { useUndoable } from './hooks/useUndoable';
 import { parseVtt, serializeVtt } from './lib/vtt';
 import { applyEdit } from './lib/engine';
 import { applyRemap, type Anchor } from './lib/remap';
+import { applyTerms, type TermRule } from './lib/terms';
 import { MIN_DURATION, formatTimestamp } from './lib/time';
 import type { Cue } from './types';
 
@@ -22,6 +24,10 @@ export default function App() {
 
   const [showImport, setShowImport] = useState(true);
   const [showRemap, setShowRemap] = useState(false);
+  const [showTerms, setShowTerms] = useState(false);
+  const [termRules, setTermRules] = useState<TermRule[]>([
+    { id: makeId(), source: '', target: '' },
+  ]);
   const [chainMode, setChainMode] = useState(true);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [playhead, setPlayhead] = useState(0);
@@ -192,6 +198,17 @@ export default function App() {
     [commit, flash],
   );
 
+  // ---------- 术语审校 ----------
+  const applyTerminology = useCallback(
+    (rules: TermRule[], selectedIds: Set<string>) => {
+      // 仅替换所勾选字幕的文本（时间与 id 不变），一次提交只产生一条撤销记录
+      commit((prev) => applyTerms(prev, rules, selectedIds));
+      setShowTerms(false);
+      flash(`已在 ${selectedIds.size} 条字幕中应用术语替换`);
+    },
+    [commit, flash],
+  );
+
   // ---------- 导出 ----------
   const exportVtt = useCallback(() => {
     const content = serializeVtt(cues);
@@ -247,6 +264,9 @@ export default function App() {
           <span className="divider" />
           <button className="btn" onClick={() => setShowRemap(true)} disabled={cues.length === 0}>
             版本映射
+          </button>
+          <button className="btn" onClick={() => setShowTerms(true)} disabled={cues.length === 0}>
+            术语审校
           </button>
           <span className="divider" />
           <button className="btn" onClick={copyVtt} disabled={cues.length === 0}>
@@ -325,6 +345,15 @@ export default function App() {
           cues={cues}
           onClose={() => setShowRemap(false)}
           onApply={applyVersionRemap}
+        />
+      )}
+      {showTerms && (
+        <TermModal
+          cues={cues}
+          rules={termRules}
+          onRulesChange={setTermRules}
+          onClose={() => setShowTerms(false)}
+          onApply={applyTerminology}
         />
       )}
       {toast && <div className="toast">{toast}</div>}

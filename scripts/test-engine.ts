@@ -4,6 +4,14 @@ import { applyEdit, computeSnap, assertInvariants } from '../src/lib/engine';
 import { parseVtt, serializeVtt } from '../src/lib/vtt';
 import { parseTimestamp, formatTimestamp, MIN_DURATION, SNAP_DISTANCE } from '../src/lib/time';
 import { validateAnchors, mapTime, previewRemap, applyRemap } from '../src/lib/remap';
+import {
+  validateRules,
+  effectiveRules,
+  replaceTerms,
+  previewTerms,
+  applyTerms,
+  type TermRule,
+} from '../src/lib/terms';
 
 let passed = 0;
 function test(name: string, fn: () => void) {
@@ -411,6 +419,182 @@ test('映射结果可序列化往返', () => {
   assert.equal(reparsed.length, 2);
   assert(Math.abs(reparsed[0].start - next[0].start) < 1e-3);
   assert(Math.abs(reparsed[1].end - next[1].end) < 1e-3);
+});
+
+// ---------- 术语审校 ----------
+function mkRules(...pairs: Array<[string, string]>): TermRule[] {
+  return pairs.map(([source, target], i) => ({ id: `r${i}`, source, target }));
+}
+
+test('规则校验：整行留空忽略，只填一半或原词重复被拒绝', () => {
+  // 全空行被忽略 → 合法
+  assert.equal(validateRules(mkRules(['', ''])), null);
+  assert.equal(validateRules(mkRules(['  ', ' '])), null);
+  // 只填一半 → 报错
+  assert(validateRules(mkRules(['hello', ''])) !== null);
+  assert(validateRules(mkRules(['', 'hi'])) !== null);
+  assert(validateRules(mkRules(['  ', 'hi'])) !== null);
+  // 原词重复 → 报错
+  assert(validateRules(mkRules(['a', 'x'], ['a', 'y'])) !== null);
+  // 合法
+  assert(validateRules(mkRules(['a', 'x'], ['ab', 'y'])) === null);
+  // effectiveRules 只保留完整行
+  const eff = effectiveRules(mkRules(['a', 'x'], ['', ''], ['b', '']));
+  assert.equal(eff.length, 1);
+  assert.equal(eff[0].source, 'a');
+});
+
+test('术语替换：区分大小写的字面匹配', () => {
+  const r = replaceTerms('Hello hello HELLO', mkRules(['hello', '嗨']));
+  assert.equal(r.newText, 'Hello 嗨 HELLO');
+  assert.equal(r.hits.length, 1);
+  assert.equal(r.hits[0].start, 6);
+  assert.equal(r.hits[0].end, 11);
+});
+
+test('术语替换：内联标签作为边界且原样保留', () => {
+  // 标签内的可见文本仍可匹配，标签本身原样保留
+  const r = replaceTerms('<b>hello</b> <i class="x">hello</i>', mkRules(['hello', 'hi']));
+  assert.equal(r.newText, '<b>hi</b> <i class="x">hi</i>');
+  assert.equal(r.hits.length, 2);
+  // 匹配不可跨越标签边界
+  const cross = replaceTerms('he<b>llo</b>', mkRules(['hello', 'X']));
+  assert.equal(cross.newText, 'he<b>llo</b>');
+  assert.equal(cross.hits.length, 0);
+  // 时间戳标签与 voice 标签同样是边界
+  const ts = replaceTerms('<00:00:01.000>hello<v Speaker>world</v>', mkRules(['hello', 'H'], ['world', 'W']));
+  assert.equal(ts.newText, '<00:00:01.000>H<v Speaker>W</v>');
+});
+
+test('术语替换：实体作为边界且原样保留', () => {
+  // &amp; 是边界：ab 不能跨越它匹配；实体内容不参与匹配
+  const r = replaceTerms('a&amp;b', mkRules(['ab', 'X'], ['amp', 'Y'], ['a', '1'], ['b', '2']));
+  assert.equal(r.newText, '1&amp;2');
+  assert.equal(r.hits.length, 2);
+  // 数字实体与未知命名实体同样视为边界
+  const num = replaceTerms('x&#65;y&foo;z', mkRules(['xy', 'X'], ['xyz', 'X'], ['foo', 'F']));
+  assert.equal(num.newText, 'x&#65;y&foo;z');
+  // 裸露的 & 不是实体，仍属可见文本
+  const bare = replaceTerms('a & b', mkRules(['&', '和']));
+  assert.equal(bare.newText, 'a 和 b');
+});
+
+test('术语替换：同一位置取最长原词，等长按规则顺序', () => {
+  // 最长优先
+  const r = replaceTerms('hello world', mkRules(['he', 'X'], ['hello', 'Y'], ['hell', 'Z']));
+  assert.equal(r.newText, 'Y world');
+  assert.equal(r.hits[0].source, 'hello');
+  // 等长（同词）按规则顺序，靠前者优先
+  const tie = replaceTerms('ab', mkRules(['ab', '第一'], ['ab', '第二']));
+  assert.equal(tie.newText, '第一');
+});
+
+test('术语替换：已选中的字符不再重复匹配', () => {
+  // "aa" 在 "aaa" 上只命中一次（0–2），余下的 a 保留
+  const r = replaceTerms('aaa', mkRules(['aa', 'X']));
+  assert.equal(r.newText, 'Xa');
+  assert.equal(r.hits.length, 1);
+  // ab 消费后，bc 无法在位置 1 命中
+  const overlap = replaceTerms('abc', mkRules(['ab', 'X'], ['bc', 'Y']));
+  assert.equal(overlap.newText, 'Xc');
+  // 替换结果不会被二次扫描：target 含 source 也不递归
+  const noRecurse = replaceTerms('a', mkRules(['a', 'aa']));
+  assert.equal(noRecurse.newText, 'aa');
+  assert.equal(noRecurse.hits.length, 1);
+});
+
+test('术语替换：命中区间与替换后区间一一对应', () => {
+  const r = replaceTerms('foo bar foo', mkRules(['foo', 'F'], ['bar', 'BB']));
+  assert.equal(r.newText, 'F BB F');
+  assert.deepEqual(
+    r.hits.map((h) => [h.start, h.end]),
+    [
+      [0, 3],
+      [4, 7],
+      [8, 11],
+    ],
+  );
+  assert.deepEqual(
+    r.newRanges.map((g) => r.newText.slice(g.start, g.end)),
+    ['F', 'BB', 'F'],
+  );
+  // 空规则表 → 原样返回
+  const noop = replaceTerms('hello', []);
+  assert.equal(noop.newText, 'hello');
+  assert.equal(noop.hits.length, 0);
+});
+
+test('术语预览：只列出有命中的字幕，按时间轴顺序', () => {
+  const cues: Cue[] = [
+    { id: 'c1', start: 5, end: 6, text: 'nothing here' },
+    { id: 'c2', start: 1, end: 2, text: 'say hello' },
+    { id: 'c3', start: 3, end: 4, text: 'hello again' },
+  ];
+  const rows = previewTerms(cues, mkRules(['hello', 'hi']));
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].cue.id, 'c2'); // 按起点排序
+  assert.equal(rows[1].cue.id, 'c3');
+  assert.equal(rows[0].newText, 'say hi');
+  assert.equal(rows[1].hits.length, 1);
+  // 无有效规则 → 无预览行
+  assert.equal(previewTerms(cues, mkRules(['', ''])).length, 0);
+});
+
+test('术语应用：仅替换所选字幕文本，时间与 id 不变', () => {
+  const cues: Cue[] = [
+    { id: 'c1', start: 0, end: 1, text: 'hello one' },
+    { id: 'c2', start: 2, end: 3, text: 'hello two' },
+    { id: 'c3', start: 4, end: 5, text: 'no match' },
+  ];
+  const rules = mkRules(['hello', 'hi']);
+  // 只勾选 c1 与 c3（c3 无命中）
+  const next = applyTerms(cues, rules, new Set(['c1', 'c3']));
+  assert.equal(next[0].text, 'hi one');
+  assert.equal(next[1].text, 'hello two'); // 未勾选 → 不变
+  assert.equal(next[2].text, 'no match');
+  // 时间与 id 不变
+  next.forEach((c, i) => {
+    assert.equal(c.id, cues[i].id);
+    assert.equal(c.start, cues[i].start);
+    assert.equal(c.end, cues[i].end);
+  });
+  // 未改动的行保持对象引用（最小化 diff）
+  assert.equal(next[1], cues[1]);
+  assert.equal(next[2], cues[2]);
+  // 原数组未被修改
+  assert.equal(cues[0].text, 'hello one');
+});
+
+test('术语应用：空选择或无命中时原样返回（不产生撤销记录）', () => {
+  const cues: Cue[] = [{ id: 'c1', start: 0, end: 1, text: 'hello' }];
+  const rules = mkRules(['hello', 'hi']);
+  assert.equal(applyTerms(cues, rules, new Set()), cues);
+  assert.equal(applyTerms(cues, rules, new Set(['nope'])), cues);
+  assert.equal(applyTerms(cues, mkRules(['zzz', 'q']), new Set(['c1'])), cues);
+  assert.equal(applyTerms(cues, mkRules(['', '']), new Set(['c1'])), cues);
+});
+
+test('术语替换结果可序列化往返，导出反映替换', () => {
+  const cues = parseVtt(`WEBVTT
+
+cue-1
+00:00:01.000 --> 00:00:03.000
+<b>帐号</b> 与 &amp; 实体
+
+cue-2
+00:00:04.000 --> 00:00:06.000
+帐号 再见`);
+  const next = applyTerms(cues, mkRules(['帐号', '账号']), new Set(['cue-1', 'cue-2']));
+  assert.equal(next[0].text, '<b>账号</b> 与 &amp; 实体');
+  assert.equal(next[1].text, '账号 再见');
+  const text = serializeVtt(next);
+  assert(text.includes('<b>账号</b> 与 &amp; 实体'));
+  assert(text.includes('账号 再见'));
+  const reparsed = parseVtt(text);
+  assert.equal(reparsed.length, 2);
+  assert.equal(reparsed[0].id, 'cue-1');
+  assert.equal(reparsed[0].text, '<b>账号</b> 与 &amp; 实体');
+  assert(Math.abs(reparsed[0].start - 1) < 1e-9);
 });
 
 console.log(`\n全部 ${passed} 个测试通过 ✅`);
